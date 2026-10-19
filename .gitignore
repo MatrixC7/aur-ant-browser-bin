@@ -1,0 +1,11 @@
+# Upstream downloaded archives
+*.zip
+*.deb
+*.tar.gz
+
+# Built Arch package
+*.pkg.tar.zst
+
+# makepkg temporary build directories
+src/
+pkg/
