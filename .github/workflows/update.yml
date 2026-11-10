@@ -17,7 +17,19 @@ jobs:
     steps:
       - name: Install git and essential tools
         run: |
-          pacman -Sy --noconfirm git openssh curl jq pacman-contrib
+          # Arch 不支持部分升级。镜像里预装的是发布当天的旧库，而 `pacman -Sy`
+          # 只刷新仓库索引、不升级已装的包，「新索引 + 旧库」必然算出
+          # "installing X breaks dependency Y"。
+          #
+          # 正确做法是全量升级（-Syu），让索引和已装包一起走。先单独升 keyring：
+          # 镜像放久了会因签名密钥轮转而报 "invalid or corrupted package
+          # (PGP signature)"，换钥匙要在升级别的包之前。
+          #
+          # 也不要手工 `pacman -U` 把单个包钉回旧版本：那只是把冲突往后拖，
+          # 旧包迟早和更新的 glibc/icu/curl 再撞一次。依赖问题必须在升级层面
+          # 解决，不能靠给单个包打补丁。
+          pacman -Syu --noconfirm --needed archlinux-keyring
+          pacman -Syu --noconfirm --needed git openssh curl jq pacman-contrib
 
       - name: Checkout GitHub repository
         uses: actions/checkout@v7
@@ -81,22 +93,46 @@ jobs:
 
       - name: Update PKGBUILD and .SRCINFO
         if: steps.check.outputs.has_update == 'true'
+        env:
+          # 用 env 传值，而不是把 ${{ }} 写进脚本正文：GitHub 的表达式替换是在
+          # bash 解析之前做纯文本替换的，值里如果带引号或 $( )，就会变成真正的
+          # 代码执行。走环境变量则只是数据。
+          #
+          # 本包比其它两个多一个 _tag 变量：上游的 release tag 是 V1.8.0 / v1.9.1
+          # 这种大小写混用、且资产文件名里不含版本号，所以 tag 必须原样写进 PKGBUILD
+          # 的 source URL，不能从 pkgver 推导。
+          NEW_VER: ${{ steps.check.outputs.new_ver }}
+          TAG_NAME: ${{ steps.check.outputs.tag_name }}
         run: |
-          NEW_VER="${{ steps.check.outputs.new_ver }}"
-          TAG_NAME="${{ steps.check.outputs.tag_name }}"
+          # pkgver 白名单：字母数字和 . _ +。同时挡住会破坏下面 sed 替换的 & 和 |。
+          if [[ ! $NEW_VER =~ ^[0-9A-Za-z][0-9A-Za-z._+]*$ ]]; then
+            echo "::error::upstream version '$NEW_VER' is not a valid Arch pkgver"
+            exit 1
+          fi
 
+          # tag 会被原样写进 PKGBUILD 的 _tag=，所以单独校验。允许 - （V1.0.0-beta）,
+          # 但不允许空格、$ ( ) | & 这些会污染 sed 或 shell 的字符。
+          if [[ ! $TAG_NAME =~ ^[0-9A-Za-z][0-9A-Za-z._+-]*$ ]]; then
+            echo "::error::upstream tag '$TAG_NAME' is not safe to write into PKGBUILD"
+            exit 1
+          fi
+
+          # makepkg 和 updpkgsums 禁止以 root 运行，需创建临时打包用户 builder
           useradd -m builder
-          echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
           chown -R builder:builder "$GITHUB_WORKSPACE"
 
-          su builder -c "
-            cd '$GITHUB_WORKSPACE'
-            sed -i 's/^pkgver=.*/pkgver=${NEW_VER}/' PKGBUILD
-            sed -i 's/^_tag=.*/_tag=${TAG_NAME}/' PKGBUILD
-            sed -i 's/^pkgrel=.*/pkgrel=1/' PKGBUILD
-            updpkgsums
-            makepkg --printsrcinfo > .SRCINFO
-          "
+          # 用 runuser 而不是 su -c "拼好的字符串"：root 切换用户本来就不需要
+          # sudo（原来的 sudoers 授权没人用），也不会把变量值混进命令文本。
+          runuser -u builder -- env \
+            NEW_VER="$NEW_VER" TAG_NAME="$TAG_NAME" GITHUB_WORKSPACE="$GITHUB_WORKSPACE" \
+            bash -euo pipefail -c '
+              cd "$GITHUB_WORKSPACE"
+              sed -i "s|^pkgver=.*|pkgver=${NEW_VER}|" PKGBUILD
+              sed -i "s|^_tag=.*|_tag=${TAG_NAME}|" PKGBUILD
+              sed -i "s|^pkgrel=.*|pkgrel=1|" PKGBUILD
+              updpkgsums
+              makepkg --printsrcinfo > .SRCINFO
+            '
 
       - name: Commit update back to GitHub repository
         if: steps.check.outputs.has_update == 'true'
@@ -125,6 +161,7 @@ jobs:
             StrictHostKeyChecking accept-new
           EOF
 
+          # 克隆 AUR 仓库到临时目录，仅复制 PKGBUILD 和 .SRCINFO（避免把 .github 目录推到 AUR）
           git clone ssh://aur@aur.archlinux.org/ant-browser-bin.git /tmp/aur-repo
           cp PKGBUILD .SRCINFO /tmp/aur-repo/
           cd /tmp/aur-repo
